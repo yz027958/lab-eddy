@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# 数据缓存：可由脚本重新下载，不进版本库
+sst_cache.npz
+*.part.npz
+
+# 临时输出
+*_5ep.json
+unet_noskip.json
+unet_sst.json
+unet_ce.json
