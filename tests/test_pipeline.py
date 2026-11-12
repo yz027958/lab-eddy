@@ -78,6 +78,66 @@ class TestLabelsAndPostprocessing(unittest.TestCase):
         mask[:, :] = 1  # 576 px -> 半径 ~ 375 km > 250
         self.assertEqual(base.detections(mask, self.data.lat, self.data.lon), [])
 
+    def _two_blob_scene(self):
+        """两个 12x12 块用一条细桥连起来：整体超限，切开后每块都合规。"""
+        mask = np.zeros((40, 40), dtype=np.int64)
+        mask[5:17, 5:17] = 1
+        mask[25:37, 25:37] = 1
+        mask[16, 5:26] = 1
+        mask[16:26, 25] = 1
+        yy, xx = np.mgrid[0:40, 0:40]
+        # 两个正距平核（暖涡），中心即物理涡心
+        anom = (1.6 * np.exp(-((yy - 10.5) ** 2 + (xx - 10.5) ** 2) / 18.0)
+                + 1.6 * np.exp(-((yy - 30.5) ** 2 + (xx - 30.5) ** 2) / 18.0))
+        anom = anom - 0.05
+        return mask, anom
+
+    def test_whole_blob_is_dropped_without_split(self) -> None:
+        mask, anom = self._two_blob_scene()
+        lat = np.linspace(20.0, 30.0, 40)
+        lon = np.linspace(140.0, 150.0, 40)
+        stats = {}
+        self.assertEqual(base.detections(mask, lat, lon, anom, stats=stats), [])
+        self.assertEqual(stats["over_limit"], 1)
+        self.assertEqual(stats["split_failed"], 0)
+
+    def test_split_large_recovers_two_eddies(self) -> None:
+        mask, anom = self._two_blob_scene()
+        lat = np.linspace(20.0, 30.0, 40)
+        lon = np.linspace(140.0, 150.0, 40)
+        dets = base.detections(mask, lat, lon, anom, split_large=True)
+        self.assertEqual(len(dets), 2)
+        for d in dets:
+            self.assertLessEqual(d.radius_km, base.MAX_RADIUS_KM)
+            self.assertEqual(d.cls, 1)
+        # 一个在左上、一个在右下（20 个格点 = 5 度）
+        cy = sorted(d.lat for d in dets)
+        self.assertGreater(cy[1] - cy[0], 4.0)
+
+    def test_coverage_reports_fragile_metric(self) -> None:
+        mask, anom = self._two_blob_scene()
+        lat = np.linspace(20.0, 30.0, 40)
+        lon = np.linspace(140.0, 150.0, 40)
+        raw = base.coverage_of_detections(mask, lat, lon)
+        self.assertEqual(raw["warm"]["pixels"], int(mask.sum()))
+        self.assertEqual(raw["warm"]["covered"], 0)          # 整块丢弃 -> 覆盖 0
+        self.assertAlmostEqual(raw["warm"]["ratio"], 0.0)
+        self.assertEqual(raw["warm"]["n_over"], 1)
+        split = base.coverage_of_detections(mask, lat, lon, split_large=True, anom=anom)
+        self.assertGreater(split["warm"]["ratio"], 0.9)      # 切分后几乎全覆盖
+
+    def test_absorption_detects_swallowed_eddy(self) -> None:
+        pred = np.ones((40, 40), dtype=np.int64)             # 一整块，必然超限
+        ref = np.zeros((40, 40), dtype=np.int64)
+        ref[18:23, 18:23] = 1                                # 25 px 的小涡
+        st = base.absorption_stats(pred, ref, (1,))
+        self.assertEqual(st["warm"]["n_ref"], 1)
+        self.assertEqual(st["warm"]["n_absorbed"], 1)
+        self.assertAlmostEqual(st["warm"]["rate"], 1.0)
+        # 反过来：预测干净 -> 不吸收
+        st2 = base.absorption_stats(ref, ref, (1,))
+        self.assertEqual(st2["warm"]["n_absorbed"], 0)
+
     def test_match_is_one_to_one(self) -> None:
         a = [base.Eddy(1, 21.0, 141.0, 60.0, 20, 1.0)]
         b = [
@@ -158,6 +218,10 @@ class TestEndToEnd(unittest.TestCase):
             self.assertLess(uu["model"]["params"], 2_000_000)
 
             import compare_models
+            for obj in (rf, uu):
+                for k in ("detection_split", "absorption", "coverage"):
+                    self.assertIn(k, obj, f"结果 json 缺诊断字段 {k}")
+                self.assertIn("ratio_split", obj["coverage"]["cold"])
 
             table = compare_models.render(rf, uu)
             self.assertIn("U-Net", table)

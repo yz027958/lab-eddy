@@ -69,7 +69,7 @@
     "warm": 42065,
     "cold": 44047
   },
-  "train_time_s": 87.63503590000073,
+  "train_time_s": 99.13394759999937,
   "pixel": {
     "warm": {
       "iou": 0.8531777956556718,
@@ -132,14 +132,75 @@
     },
     "macro_f1": 0.40816326530612246
   },
+  "detection_split": {
+    "warm": {
+      "micro": {
+        "precision": 0.6896551724137931,
+        "recall": 1.0,
+        "f1": 0.8163265306122449,
+        "tp": 60,
+        "fp": 27,
+        "fn": 0
+      },
+      "macro_f1": 0.8163265306122449,
+      "radius_mae_km": 3.226102831525402,
+      "amp_mae": 0.059662246704101564
+    },
+    "cold": {
+      "micro": {
+        "precision": 0.98914223669924,
+        "recall": 0.9869989165763814,
+        "f1": 0.9880694143167029,
+        "tp": 911,
+        "fp": 10,
+        "fn": 12
+      },
+      "macro_f1": 0.9880694143167029,
+      "radius_mae_km": 3.6515049416195904,
+      "amp_mae": 0.028930491660481356
+    },
+    "macro_f1": 0.902197972464474
+  },
+  "absorption": {
+    "warm": {
+      "n_ref": 60,
+      "n_absorbed": 0,
+      "rate": 0.0
+    },
+    "cold": {
+      "n_ref": 12,
+      "n_absorbed": 12,
+      "rate": 1.0
+    }
+  },
+  "coverage": {
+    "warm": {
+      "pixels": 2190,
+      "covered": 1480,
+      "covered_split": 1480,
+      "n_comp": 189,
+      "n_over": 0,
+      "ratio": 0.6757990867579908,
+      "ratio_split": 0.6757990867579908
+    },
+    "cold": {
+      "pixels": 86823,
+      "covered": 582,
+      "covered_split": 86743,
+      "n_comp": 42,
+      "n_over": 10,
+      "ratio": 0.006703292906257558,
+      "ratio_split": 0.9990785851675247
+    }
+  },
   "threshold_drift": {
     "thresh_0.3": 0.9023445968591288,
     "thresh_0.5": 0.830488763793438
   },
   "daily_count_corr": 0.2743421756448668,
   "timing": {
-    "unet_infer_per_day_s": 0.022011279999969702,
-    "rule_per_day_s": 8.710000020073495e-06
+    "unet_infer_per_day_s": 0.025155199999790056,
+    "rule_per_day_s": 2.16500000533415e-05
   },
   "model": {
     "name": "unet",

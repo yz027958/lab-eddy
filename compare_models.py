@@ -26,6 +26,8 @@ REQUIRED_KEYS = (
     "data", "split", "rule", "class_counts", "train_time_s",
     "pixel", "confusion_matrix", "detection", "threshold_drift",
     "daily_count_corr", "timing",
+    # 诊断字段：两模型都必须有，缺了说明版本不一致
+    "detection_split", "absorption", "coverage",
 )
 
 #: 对比行：(展示名, 取值函数, 格式, 越大越好?)
@@ -119,6 +121,58 @@ def render(rf: Dict[str, Any], unet: Dict[str, Any]) -> str:
     n_param = dig(unet, "model.params")
     if n_param:
         lines.append(f"| U-Net 参数量 | — | {int(n_param):,} | |")
+
+    lines.append("")
+    lines.append("## 检测级指标的口径：先看它量到了什么")
+    lines.append("")
+    lines.append("`max_radius=250 km` 在这块窗口里很严：参考标签的冷区常常连成一整片"
+                 "（约 8.4e3 像素、等效半径 1.4e3 km），整片会被后处理丢弃。下表是"
+                 "**检测级指标实际覆盖的已标注像素比例**——比例越低，检测级 F1 越不能代表总体。")
+    lines.append("")
+    lines.append("| 类别 | 参考像素 | 形成检测的像素 | 覆盖比例 | 超限连通域数 | 切分后覆盖比例 |")
+    lines.append("|---|---:|---:|---:|---:|---:|")
+    for k in ("warm", "cold"):
+        ca = dig(rf, f"coverage/{k}")
+        cb = dig(unet, f"coverage/{k}")
+        ca = ca or {}
+        lines.append(f"| {k} 随机森林 | {ca.get('pixels', '—')} | {ca.get('covered', '—')} | "
+                     f"{ca.get('ratio', 0):.2%} | {ca.get('n_over', '—')} | "
+                     f"{ca.get('ratio_split', 0):.2%} |")
+        cb = cb or {}
+        lines.append(f"| {k} U-Net | {cb.get('pixels', '—')} | {cb.get('covered', '—')} | "
+                     f"{cb.get('ratio', 0):.2%} | {cb.get('n_over', '—')} | "
+                     f"{cb.get('ratio_split', 0):.2%} |")
+
+    lines.append("")
+    lines.append("### 切分超限大块之后（常量不变：min_area=12，max_radius=250 km）")
+    lines.append("")
+    lines.append("超限连通域先按距平的局部极值切块，再走同一套面积/半径过滤。")
+    lines.append("")
+    lines.append("| 指标 | 随机森林 | U-Net | 更优 |")
+    lines.append("|---|---:|---:|---:|")
+    for label, path, f, hb in [
+        ("检测级 warm F1（切分后）", "detection_split/warm/micro/f1", "{:.4f}", True),
+        ("检测级 cold F1（切分后）", "detection_split/cold/micro/f1", "{:.4f}", True),
+        ("检测级 macro F1（切分后）", "detection_split/macro_f1", "{:.4f}", True),
+    ]:
+        va, vb = dig(rf, path), dig(unet, path)
+        lines.append(f"| {label} | {fmt(va, path, f)} | {fmt(vb, path, f)} | {mark(vb, va, hb)} |")
+
+    lines.append("")
+    lines.append("### 吸收率：可检出的涡旋被巨型连通域吞掉的比例")
+    lines.append("")
+    lines.append("参考里本来能形成检测的涡旋，其多数像素落在预测的**超限**连通域内，"
+                 "就算被吞掉——像素判对也没用，整块会被丢弃。")
+    lines.append("")
+    lines.append("| 类别 | 随机森林 | U-Net |")
+    lines.append("|---|---:|---:|")
+    for k in ("warm", "cold"):
+        out = []
+        for obj in (rf, unet):
+            ab = dig(obj, f"absorption/{k}") or {}
+            out.append(f"{ab.get('n_absorbed', '—')} / {ab.get('n_ref', '—')} "
+                       f"({ab.get('rate', 0):.0%})")
+        lines.append(f"| {k} | {out[0]} | {out[1]} |")
 
     lines.append("")
     lines.append("## 类别计数（训练期有效像素）")

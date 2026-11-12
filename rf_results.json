@@ -69,7 +69,7 @@
     "warm": 42065,
     "cold": 44047
   },
-  "train_time_s": 12.150182800000039,
+  "train_time_s": 13.6578748000029,
   "pixel": {
     "warm": {
       "iou": 1.0,
@@ -132,13 +132,74 @@
     },
     "macro_f1": 1.0
   },
+  "detection_split": {
+    "warm": {
+      "micro": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "tp": 60,
+        "fp": 0,
+        "fn": 0
+      },
+      "macro_f1": 1.0,
+      "radius_mae_km": 0.0,
+      "amp_mae": 0.0
+    },
+    "cold": {
+      "micro": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "tp": 923,
+        "fp": 0,
+        "fn": 0
+      },
+      "macro_f1": 1.0,
+      "radius_mae_km": 0.0,
+      "amp_mae": 0.0
+    },
+    "macro_f1": 1.0
+  },
+  "absorption": {
+    "warm": {
+      "n_ref": 60,
+      "n_absorbed": 0,
+      "rate": 0.0
+    },
+    "cold": {
+      "n_ref": 12,
+      "n_absorbed": 0,
+      "rate": 0.0
+    }
+  },
+  "coverage": {
+    "warm": {
+      "pixels": 2190,
+      "covered": 1480,
+      "covered_split": 1480,
+      "n_comp": 189,
+      "n_over": 0,
+      "ratio": 0.6757990867579908,
+      "ratio_split": 0.6757990867579908
+    },
+    "cold": {
+      "pixels": 86823,
+      "covered": 582,
+      "covered_split": 86743,
+      "n_comp": 42,
+      "n_over": 10,
+      "ratio": 0.006703292906257558,
+      "ratio_split": 0.9990785851675247
+    }
+  },
   "threshold_drift": {
     "thresh_0.3": 0.8885385191255741,
     "thresh_0.5": 0.8877292157450231
   },
   "daily_count_corr": 1.0,
   "timing": {
-    "unet_infer_per_day_s": 0.02846645999998145,
-    "rule_per_day_s": 7.900000036897837e-06
+    "unet_infer_per_day_s": 0.029807739999887416,
+    "rule_per_day_s": 1.912000006996095e-05
   }
 }

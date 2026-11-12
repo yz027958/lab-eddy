@@ -139,6 +139,19 @@ MATCH_RADIUS_FACTOR = 1.0   # 预测中心落在参考涡旋半径 1 倍内算�
 `argmax 掩膜 → scipy.ndimage.label(8 连通) → 面积过滤 → 半径过滤 → 中心/半径/振幅`。
 参数一改，检测级指标就不可比 —— 这一步没有自由度，两个脚本共用同一份实现。
 
+**超限大块的两种处理**（`detections(..., split_large=)`）：
+
+- `False`（方案原始口径）：半径超 `MAX_RADIUS_KM` 的连通域**整块丢弃**。这块窗口里规则法的
+  冷区常连成一整片（约 8.4×10³ 像素、等效半径 1.4×10³ km），整块丢下去，检测级指标只覆盖
+  **0.67%** 的冷像素 —— 它量的其实是一天 1–2 个孤立小涡。
+- `True`（诊断口径，新增）：先用**距平的局部极值**做 marker（暖涡取极大、冷涡取极小，
+  种子最小间距 7 像素），按最近种子把连通域切成多块（欧氏 Voronoi，等价极值 marker 分水岭），
+  再走同一套 `MIN_AREA / MAX_RADIUS_KM`。覆盖度回到 **99.91%**。
+
+两个口径都会写进结果 json（`detection` / `detection_split`），主表仍以方案原始口径为准。
+注意切分用的是**同一个距平场**给两边取种子，所以它是「同一切分下两个掩膜是否吻合」，
+不是独立的检测能力（见 `REPORT.md` §4.5）。
+
 ---
 
 ## 7. 评估
@@ -152,6 +165,10 @@ MATCH_RADIUS_FACTOR = 1.0   # 预测中心落在参考涡旋半径 1 倍内算�
   "pixel": {"warm": {"iou": 0, "dice": 0, "tp": 0, "fp": 0, "fn": 0}, "cold": {...}},
   "confusion_matrix": [[0,0,0],[0,0,0],[0,0,0]],
   "detection": {"warm": {"micro": {...}, "macro_f1": 0, "radius_mae_km": 0, "amp_mae": 0}, "cold": {...}},
+  "detection_split": {"warm": {...}, "cold": {...}, "macro_f1": 0},
+  "absorption": {"warm": {"n_ref": 0, "n_absorbed": 0, "rate": 0}, "cold": {...}},
+  "coverage": {"warm": {"pixels": 0, "covered": 0, "ratio": 0, "n_comp": 0, "n_over": 0,
+                        "covered_split": 0, "ratio_split": 0}, "cold": {...}},
   "threshold_drift": {"thresh_0.3": 0, "thresh_0.5": 0},
   "daily_count_corr": 0.0,
   "timing": {"unet_infer_per_day_s": 0.0, "rule_per_day_s": 0.0}
@@ -160,6 +177,12 @@ MATCH_RADIUS_FACTOR = 1.0   # 预测中心落在参考涡旋半径 1 倍内算�
 
 阈值漂移的做法：**固定模型预测**，把参考标签的阈值换成 ±0.3 / ±0.5 重算，看 IoU 掉多少 ——
 用来检验模型是不是只把 0.4 这个阈值背了下来。
+
+两个诊断字段帮助判断「检测级 F1 还能不能读」：
+
+- `coverage`：检测级指标实际覆盖了多少已标注像素。比例很低时，检测级数字只代表一小撮像素。
+- `absorption`：参考里本来能形成检测的涡旋，有多少被预测的**超限**连通域吞掉
+  （像素判对也没用，整块会被丢弃）。
 
 ---
 
@@ -173,6 +196,9 @@ python lab_eddy_rf.py && \
 python lab_eddy_unet.py && \
 python compare_models.py --out compare.md && \
 python make_figures.py
+
+# 只改了后处理/指标、模型没变时，别重训（会从 unet_weights.pt 复原结构）
+python lab_eddy_unet.py --eval-only
 ```
 
 先验证流水线（方案 §8：先用 5 epoch 跑通）：

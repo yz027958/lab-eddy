@@ -357,6 +357,68 @@ class Eddy:
     amplitude: float
 
 
+#: 切分超限大块时，局部极值种子的最小间距（像素）
+SPLIT_SEED_FILTER = 7
+
+
+def _eddy_from_index(
+    idx: np.ndarray,
+    cls: int,
+    lat: np.ndarray,
+    lon: np.ndarray,
+    anom: np.ndarray | None,
+    cell_km: float,
+) -> Eddy:
+    """由一组像素索引算出中心/半径/振幅。"""
+    i_c = float(idx[:, 0].mean())
+    j_c = float(idx[:, 1].mean())
+    la = float(np.interp(i_c, np.arange(lat.size), lat))
+    lo = float(np.interp(j_c, np.arange(lon.size), lon))
+    if anom is None:
+        amp = float("nan")
+    else:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            amp = float(np.nanmean(np.abs(anom[idx[:, 0], idx[:, 1]])))
+    return Eddy(cls=cls, lat=la, lon=lo,
+                radius_km=float(np.sqrt(idx.shape[0] / np.pi) * cell_km),
+                area=int(idx.shape[0]), amplitude=amp)
+
+
+def split_component(
+    binary: np.ndarray,
+    anom: np.ndarray,
+    cls: int,
+    size: int = SPLIT_SEED_FILTER,
+) -> np.ndarray | None:
+    """把一个超限连通域按距平的局部极值切开。
+
+    做法：区域内找暖涡的局部极大 / 冷涡的局部极小作为种子，然后按
+    「最近的种子」把每个像素分给某一块（欧氏 Voronoi，等价于用极值点做
+    marker 的分水岭）。用距平而不是距离变换，是因为涡旋的物理中心就是距平
+    极值点，这样切出来的每一块都有明确的物理含义。
+
+    Returns:
+        ``(H, W)`` 整数标签（0 = 不在该连通域内），或 ``None``（种子不足，切不开）。
+    """
+    if anom is None:
+        return None
+    fill = -np.inf if cls == 1 else np.inf
+    g = np.where(binary, anom, fill).astype(np.float64)
+    if cls == 1:
+        seeds = (g == ndimage.maximum_filter(g, size=size, mode="nearest")) & binary
+    else:
+        seeds = (g == ndimage.minimum_filter(g, size=size, mode="nearest")) & binary
+    slab, n_seed = ndimage.label(seeds, structure=np.ones((3, 3), dtype=bool))
+    if n_seed < 2:
+        return None
+    # distance_transform_edt 返回「最近的 0 元素」的索引，0 正好是种子
+    nearest = ndimage.distance_transform_edt(slab == 0, return_indices=True)[1]
+    piece = slab[nearest[0], nearest[1]]
+    piece[~binary] = 0
+    return piece
+
+
 def detections(
     mask: np.ndarray,
     lat: np.ndarray,
@@ -366,6 +428,8 @@ def detections(
     max_radius_km: float = MAX_RADIUS_KM,
     cell_km: float = CELL_KM,
     classes: Sequence[int] = (1, 2),
+    split_large: bool = False,
+    stats: Dict[str, int] | None = None,
 ) -> List[Eddy]:
     """把像素掩膜转成涡旋列表。
 
@@ -374,39 +438,155 @@ def detections(
     Args:
         mask: ``(H, W)`` 整数标签图，值与 ``classes`` 对应。
         anom: 可选，用于计算振幅（区域内平均 |距平|），缺省则振幅为 ``nan``。
+        split_large: 超过 ``max_radius_km`` 的连通域默认**整块丢弃**；
+            打开后先按距平极值切成若干块再过滤。规则法标签在这种窗口里
+            会产生上千公里的连通冷区，整块丢弃会让检测级指标只覆盖极少数像素。
+        stats: 可选，回填各种计数（``over_limit`` / ``split_ok`` / ``split_failed``）。
 
     Returns:
         ``Eddy`` 列表，顺序为 ``(cls, lat)`` 稳定排序，便于复现。
     """
     out: List[Eddy] = []
     structure = np.ones((3, 3), dtype=bool)
+    if stats is None:
+        stats = {}
+    stats.setdefault("over_limit", 0)
+    stats.setdefault("split_ok", 0)
+    stats.setdefault("split_failed", 0)
+
     for cls in classes:
         binary = mask == cls
         if not binary.any():
             continue
         lab, n = ndimage.label(binary, structure=structure)
         for k in range(1, n + 1):
-            idx = np.argwhere(lab == k)
-            area = int(idx.shape[0])
+            comp = lab == k
+            idx = np.argwhere(comp)
+            if idx.shape[0] < min_area:
+                continue
+            if np.sqrt(idx.shape[0] / np.pi) * cell_km <= max_radius_km:
+                out.append(_eddy_from_index(idx, cls, lat, lon, anom, cell_km))
+                continue
+            # 超限大块
+            stats["over_limit"] += 1
+            if not split_large:
+                continue
+            piece = split_component(comp, anom, cls)
+            if piece is None:
+                stats["split_failed"] += 1
+                continue
+            ok = 0
+            for pid in range(1, int(piece.max()) + 1):
+                pidx = np.argwhere(piece == pid)
+                if pidx.shape[0] < min_area:
+                    continue
+                if np.sqrt(pidx.shape[0] / np.pi) * cell_km > max_radius_km:
+                    continue
+                out.append(_eddy_from_index(pidx, cls, lat, lon, anom, cell_km))
+                ok += 1
+            stats["split_ok"] += 1 if ok else 0
+            if not ok:
+                stats["split_failed"] += 1
+
+    out.sort(key=lambda e: (e.cls, e.lat, e.lon))
+    return out
+
+
+def coverage_of_detections(
+    mask: np.ndarray,
+    lat: np.ndarray,
+    lon: np.ndarray,
+    cell_km: float = CELL_KM,
+    min_area: int = MIN_AREA,
+    max_radius_km: float = MAX_RADIUS_KM,
+    classes: Sequence[int] = (1, 2),
+    split_large: bool = False,
+    anom: np.ndarray | None = None,
+) -> Dict[str, Dict[str, float]]:
+    """检测级指标到底覆盖了多少已标注像素。
+
+    返回每个类别 ``{"pixels": 总标注像素, "covered": 能形成检测的像素,
+    "ratio": covered/pixels, "n_comp": 连通域数, "n_over": 超限连通域数}``。
+    比例很低就说明检测级指标只代表一小撮像素，不能当总体性能读。
+    """
+    structure = np.ones((3, 3), dtype=bool)
+    out: Dict[str, Dict[str, float]] = {}
+    for cls in classes:
+        binary = mask == cls
+        lab, n = ndimage.label(binary, structure=structure)
+        covered = 0
+        n_over = 0
+        for k in range(1, n + 1):
+            comp = lab == k
+            area = int(comp.sum())
             if area < min_area:
                 continue
-            radius = float(np.sqrt(area / np.pi) * cell_km)
-            if radius > max_radius_km:
+            if np.sqrt(area / np.pi) * cell_km > max_radius_km:
+                n_over += 1
+                if split_large and anom is not None:
+                    piece = split_component(comp, anom, cls)
+                    if piece is not None:
+                        for pid in range(1, int(piece.max()) + 1):
+                            pa = int((piece == pid).sum())
+                            if pa >= min_area and np.sqrt(pa / np.pi) * cell_km <= max_radius_km:
+                                covered += pa
                 continue
-            i_c = float(idx[:, 0].mean())
-            j_c = float(idx[:, 1].mean())
-            # 像素索引 -> 经纬度（线性插值到格点中心）
-            la = float(np.interp(i_c, np.arange(lat.size), lat))
-            lo = float(np.interp(j_c, np.arange(lon.size), lon))
-            if anom is None:
-                amp = float("nan")
-            else:
-                with warnings.catch_warnings():
-                    # 涡旋块盖住陆地格点时子集可能全是 NaN
-                    warnings.simplefilter("ignore", RuntimeWarning)
-                    amp = float(np.nanmean(np.abs(anom[idx[:, 0], idx[:, 1]])))
-            out.append(Eddy(cls=cls, lat=la, lon=lo, radius_km=radius, area=area, amplitude=amp))
-    out.sort(key=lambda e: (e.cls, e.lat, e.lon))
+            covered += area
+        total = int(binary.sum())
+        out[CLASS_NAMES[cls]] = {
+            "pixels": total,
+            "covered": covered,
+            "ratio": (covered / total) if total else 0.0,
+            "n_comp": n,
+            "n_over": n_over,
+        }
+    return out
+
+
+def absorption_stats(
+    pred_mask: np.ndarray,
+    ref_mask: np.ndarray,
+    cells: Sequence[int],
+    cell_km: float = CELL_KM,
+    min_area: int = MIN_AREA,
+    max_radius_km: float = MAX_RADIUS_KM,
+) -> Dict[str, Dict[str, float]]:
+    """参考里那些「本来能检出」的涡旋，有多少被预测的巨型连通域吞掉了。
+
+    「吞掉」的定义：参考涡旋的多数像素在预测里落在同一个**超过半径上限**的
+    连通域内。这个数直接暴露后处理的脆性——像素判得再准，只要有一圈误报
+    把小块和大块连起来，整块就会被丢弃。
+    """
+    structure = np.ones((3, 3), dtype=bool)
+    out: Dict[str, Dict[str, float]] = {}
+    for cls in cells:
+        ref_bin = ref_mask == cls
+        pred_bin = pred_mask == cls
+        rlab, rn = ndimage.label(ref_bin, structure=structure)
+        plab, pn = ndimage.label(pred_bin, structure=structure)
+        if pn:
+            parea = np.bincount(plab.ravel())
+        else:
+            parea = np.zeros(1, dtype=int)
+        n_ref = n_absorbed = 0
+        for k in range(1, rn + 1):
+            idx = np.argwhere(rlab == k)
+            area = idx.shape[0]
+            if area < min_area or np.sqrt(area / np.pi) * cell_km > max_radius_km:
+                continue
+            n_ref += 1
+            pk = plab[idx[:, 0], idx[:, 1]]
+            pk = pk[pk > 0]
+            if pk.size == 0:
+                continue
+            host = int(np.bincount(pk).argmax())
+            if np.sqrt(parea[host] / np.pi) * cell_km > max_radius_km:
+                n_absorbed += 1
+        out[CLASS_NAMES[cls]] = {
+            "n_ref": n_ref,
+            "n_absorbed": n_absorbed,
+            "rate": (n_absorbed / n_ref) if n_ref else 0.0,
+        }
     return out
 
 
@@ -508,27 +688,16 @@ def confusion_matrix(pred: np.ndarray, ref: np.ndarray, n: int = 3) -> List[List
     return cm.tolist()
 
 
-def evaluate(
+def _detection_block(
     preds: np.ndarray,
     refs: np.ndarray,
     anoms: np.ndarray,
     lat: np.ndarray,
     lon: np.ndarray,
     dates: Sequence[str],
-    infer_time_s: float,
-    rule_time_s: float,
-) -> Dict[str, object]:
-    """把逐日预测拼成方案 §7 要求的评估字典。
-
-    Args:
-        preds: ``(T, H, W)`` 预测标签（0/1/2）。
-        refs: ``(T, H, W)`` 规则法参考标签（0/1/2，缺测 -1）。
-        anoms: ``(T, H, W)`` 距平，用于振幅与阈值漂移。
-    """
-    pixel = pixel_metrics(preds, refs)
-    cm = confusion_matrix(preds, refs)
-
-    # --- 检测级 ---
+    split: bool,
+) -> Tuple[Dict[str, object], Dict[int, Dict[str, List[int]]]]:
+    """跑一遍检测级评估，返回 (汇总字典, 逐日计数)。"""
     detection: Dict[str, object] = {}
     daily_counts = {c: {"pred": [], "ref": []} for c in (1, 2)}
     radius_err = {c: [] for c in (1, 2)}
@@ -538,8 +707,8 @@ def evaluate(
     fn = {c: 0 for c in (1, 2)}
 
     for t, _d in enumerate(dates):
-        p_list = detections(preds[t], lat, lon, anoms[t])
-        r_list = detections(refs[t], lat, lon, anoms[t])
+        p_list = detections(preds[t], lat, lon, anoms[t], split_large=split)
+        r_list = detections(refs[t], lat, lon, anoms[t], split_large=split)
         for c in (1, 2):
             pc = [e for e in p_list if e.cls == c]
             rc = [e for e in r_list if e.cls == c]
@@ -564,6 +733,33 @@ def evaluate(
             "amp_mae": float(np.mean(amp_err[c])) if amp_err[c] else 0.0,
         }
     detection["macro_f1"] = float(np.mean([detection[CLASS_NAMES[c]]["macro_f1"] for c in (1, 2)]))
+    return detection, daily_counts
+
+
+def evaluate(
+    preds: np.ndarray,
+    refs: np.ndarray,
+    anoms: np.ndarray,
+    lat: np.ndarray,
+    lon: np.ndarray,
+    dates: Sequence[str],
+    infer_time_s: float,
+    rule_time_s: float,
+) -> Dict[str, object]:
+    """把逐日预测拼成方案 §7 要求的评估字典。
+
+    Args:
+        preds: ``(T, H, W)`` 预测标签（0/1/2）。
+        refs: ``(T, H, W)`` 规则法参考标签（0/1/2，缺测 -1）。
+        anoms: ``(T, H, W)`` 距平，用于振幅与阈值漂移。
+    """
+    pixel = pixel_metrics(preds, refs)
+    cm = confusion_matrix(preds, refs)
+
+    # --- 检测级 ---
+    detection, daily_counts = _detection_block(preds, refs, anoms, lat, lon, dates, split=False)
+    # 超限大块先切再过滤的版本（方案常量不变，只多加一步切分）
+    detection_split, _ = _detection_block(preds, refs, anoms, lat, lon, dates, split=True)
 
     # --- 逐日检测总数相关 r（两类各算一个，取平均）---
     rs = []
@@ -580,10 +776,48 @@ def evaluate(
         m = pixel_metrics(preds, ref_alt)
         drift[name] = float(np.mean([m["warm"]["iou"], m["cold"]["iou"]]))
 
+    # --- 诊断 1：参考里本来能检出的涡旋，有多少被预测的巨型块吞掉 ---
+    absorbed = {c: {"n_ref": 0, "n_absorbed": 0} for c in (1, 2)}
+    for t in range(len(dates)):
+        st = absorption_stats(preds[t], refs[t], (1, 2))
+        for c in (1, 2):
+            absorbed[c]["n_ref"] += int(st[CLASS_NAMES[c]]["n_ref"])
+            absorbed[c]["n_absorbed"] += int(st[CLASS_NAMES[c]]["n_absorbed"])
+    absorption = {
+        CLASS_NAMES[c]: {
+            "n_ref": absorbed[c]["n_ref"],
+            "n_absorbed": absorbed[c]["n_absorbed"],
+            "rate": (absorbed[c]["n_absorbed"] / absorbed[c]["n_ref"]) if absorbed[c]["n_ref"] else 0.0,
+        }
+        for c in (1, 2)
+    }
+
+    # --- 诊断 2：检测级指标覆盖了多少已标注像素 ---
+    cov = {n: {"pixels": 0, "covered": 0, "covered_split": 0, "n_comp": 0, "n_over": 0}
+           for n in CLASS_NAMES[1:]}
+    for t in range(len(dates)):
+        a = coverage_of_detections(refs[t], lat, lon, split_large=False)
+        b = coverage_of_detections(refs[t], lat, lon, split_large=True, anom=anoms[t])
+        for n in cov:
+            for k in ("pixels", "covered", "n_comp", "n_over"):
+                cov[n][k] += int(a[n][k])
+            cov[n]["covered_split"] += int(b[n]["covered"])
+    coverage = {
+        n: {
+            **cov[n],
+            "ratio": (cov[n]["covered"] / cov[n]["pixels"]) if cov[n]["pixels"] else 0.0,
+            "ratio_split": (cov[n]["covered_split"] / cov[n]["pixels"]) if cov[n]["pixels"] else 0.0,
+        }
+        for n in cov
+    }
+
     return {
         "pixel": pixel,
         "confusion_matrix": cm,
         "detection": detection,
+        "detection_split": detection_split,
+        "absorption": absorption,
+        "coverage": coverage,
         "threshold_drift": drift,
         "daily_count_corr": daily_count_corr,
         "timing": {

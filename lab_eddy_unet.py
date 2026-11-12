@@ -437,6 +437,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--force-download", action="store_true")
     p.add_argument("--no-download", action="store_true")
     p.add_argument("--no-save", action="store_true", help="不写权重，只打印指标")
+    p.add_argument("--eval-only", action="store_true",
+                   help="加载 --weights 只做测试日推理+评估，不训练（后处理/指标改动后重评用）")
     args = p.parse_args(argv)
 
     np.random.seed(args.seed)
@@ -466,62 +468,98 @@ def main(argv: Sequence[str] | None = None) -> int:
         cw = np.array([float(x) for x in args.class_weights.split(",")], dtype=np.float32)
     print(f"[loss] class weights = {cw.round(3).tolist()}")
 
-    norm = Normalizer.fit(data.sst, anom, train_idx)
-    use_anom = args.channels == "sst_anom"
-    in_ch = 3 if use_anom else 2
+    if args.eval_only:
+        # 只重评：结构参数以权重文件为准，避免命令行默认值与存盘时不一致
+        ckpt = torch.load(args.weights, map_location="cpu", weights_only=False)
+        cfg = dict(ckpt["config"])
+        args.base = int(cfg["base"])
+        args.depth = int(cfg["depth"])
+        args.no_skip = not bool(cfg["skip"])
+        args.dropout = float(cfg["dropout"])
+        args.patch = int(cfg["patch"])
+        args.stride = int(cfg["stride"])
+        args.channels = str(cfg["channels"])
+        if not np.allclose(np.asarray(bg, dtype=np.float32),
+                           np.asarray(ckpt["background"], dtype=np.float32)):
+            print("[warn] 权重里的距平背景与当前缓存算出的不一致，仍以当前缓存为准")
+        norm = Normalizer.from_state(ckpt["normalizer"])
+        use_anom = args.channels == "sst_anom"
+        in_ch = int(cfg["in_ch"])
+        model = UNet(in_ch=in_ch, n_cls=3, base=args.base, depth=args.depth,
+                     skip=not args.no_skip, dropout=args.dropout).to(device)
+        model.load_state_dict(ckpt["state_dict"])
+        n_param = count_parameters(model)
+        hist = ckpt.get("history", {}) or {}
+        train_time = float(ckpt.get("train_time_s", 0.0))
+        n_train_patches = int(ckpt.get("train_patches", 0))
+        if train_time <= 0.0 and os.path.exists(args.out):
+            # 老权重没存训练耗时：沿用上一次结果文件里的值，别把 0 写进对比表
+            with open(args.out, encoding="utf-8") as f:
+                train_time = float(json.load(f).get("train_time_s", 0.0))
+            print(f"[load] train_time 沿用 {args.out}: {train_time:.1f}s")
+        print(f"[load] {args.weights}  params={n_param:,} ({n_param / 1e6:.2f}M)  "
+              f"跳过训练，train_time 沿用权重文件 {train_time:.1f}s")
+    else:
+        norm = Normalizer.fit(data.sst, anom, train_idx)
+        use_anom = args.channels == "sst_anom"
+        in_ch = 3 if use_anom else 2
 
-    X, y = build_train_arrays(data, anom, norm, train_idx, args.patch, args.stride, use_anom)
-    print(f"[patches] patch={args.patch} stride={args.stride} -> train patches {X.shape[0]}")
+        X, y = build_train_arrays(data, anom, norm, train_idx, args.patch, args.stride, use_anom)
+        n_train_patches = int(X.shape[0])
+        print(f"[patches] patch={args.patch} stride={args.stride} -> train patches {n_train_patches}")
 
-    # --- 模型 ---
-    model = UNet(in_ch=in_ch, n_cls=3, base=args.base, depth=args.depth,
-                 skip=not args.no_skip, dropout=args.dropout).to(device)
-    n_param = count_parameters(model)
-    print(f"[model] U-Net base={args.base} depth={args.depth} skip={not args.no_skip} "
-          f"params={n_param:,} ({n_param / 1e6:.2f}M)")
+        # --- 模型 ---
+        model = UNet(in_ch=in_ch, n_cls=3, base=args.base, depth=args.depth,
+                     skip=not args.no_skip, dropout=args.dropout).to(device)
+        n_param = count_parameters(model)
+        print(f"[model] U-Net base={args.base} depth={args.depth} skip={not args.no_skip} "
+              f"params={n_param:,} ({n_param / 1e6:.2f}M)")
 
-    # 监控用：只打印，不参与任何选择（避免测试日泄漏）
-    def val_iou(m: nn.Module) -> float:
-        m.eval()
-        preds = []
-        for i in test_idx:
-            img = norm(data.sst[i], anom[i], use_anom=use_anom)
-            preds.append(predict_day(m, img, args.patch, args.stride, device))
-        preds = np.stack(preds)
-        refs = labels[test_idx]
-        ok = refs >= 0
-        ious = []
-        for c in (1, 2):
-            pm, rm = (preds[ok] == c), (refs[ok] == c)
-            inter = int(np.logical_and(pm, rm).sum())
-            union = int(np.logical_or(pm, rm).sum())
-            ious.append(inter / union if union else 0.0)
-        m.train()
-        return float(np.mean(ious))
+        # 监控用：只打印，不参与任何选择（避免测试日泄漏）
+        def val_iou(m: nn.Module) -> float:
+            m.eval()
+            preds = []
+            for i in test_idx:
+                img = norm(data.sst[i], anom[i], use_anom=use_anom)
+                preds.append(predict_day(m, img, args.patch, args.stride, device))
+            preds = np.stack(preds)
+            refs = labels[test_idx]
+            ok = refs >= 0
+            ious = []
+            for c in (1, 2):
+                pm, rm = (preds[ok] == c), (refs[ok] == c)
+                inter = int(np.logical_and(pm, rm).sum())
+                union = int(np.logical_or(pm, rm).sum())
+                ious.append(inter / union if union else 0.0)
+            m.train()
+            return float(np.mean(ious))
 
-    # --- 训练 ---
-    t0 = time.perf_counter()
-    hist = train(X, y, model, args.epochs, args.batch, args.lr, cw, device,
-                 mode=args.loss, seed=args.seed, val_fn=val_iou)
-    train_time = time.perf_counter() - t0
-    print(f"[train] {train_time:.1f}s ({train_time / 60:.1f} min)")
+        # --- 训练 ---
+        t0 = time.perf_counter()
+        hist = train(X, y, model, args.epochs, args.batch, args.lr, cw, device,
+                     mode=args.loss, seed=args.seed, val_fn=val_iou)
+        train_time = time.perf_counter() - t0
+        print(f"[train] {train_time:.1f}s ({train_time / 60:.1f} min)")
 
-    if not args.no_save:
-        torch.save(
-            {
-                "state_dict": model.state_dict(),
-                "config": {
-                    "in_ch": in_ch, "n_cls": 3, "base": args.base, "depth": args.depth,
-                    "skip": not args.no_skip, "dropout": args.dropout,
-                    "patch": args.patch, "stride": args.stride, "channels": args.channels,
+        if not args.no_save:
+            torch.save(
+                {
+                    "state_dict": model.state_dict(),
+                    "config": {
+                        "in_ch": in_ch, "n_cls": 3, "base": args.base, "depth": args.depth,
+                        "skip": not args.no_skip, "dropout": args.dropout,
+                        "patch": args.patch, "stride": args.stride, "channels": args.channels,
+                    },
+                    "normalizer": norm.state(),
+                    "background": bg,
+                    "history": hist,
+                    "train_time_s": float(train_time),
+                    "train_patches": int(n_train_patches),
                 },
-                "normalizer": norm.state(),
-                "background": bg,
-                "history": hist,
-            },
-            args.weights,
-        )
-        print(f"[save] {args.weights}")
+                args.weights,
+            )
+            print(f"[save] {args.weights}")
+
 
     # --- 推理 ---
     model.eval()
@@ -564,7 +602,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "epochs": args.epochs,
         "batch": args.batch,
         "lr": args.lr,
-        "train_patches": int(X.shape[0]),
+        "train_patches": int(n_train_patches),
         "history": {k: [float(v) for v in vals] for k, vals in hist.items()},
     }
 
